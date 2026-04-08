@@ -33,7 +33,9 @@ class TimelineLane {
     return {
       'id': id,
       'title': title,
-      'color': color?.value,
+      'color': color != null
+          ? "#${color!.value.toRadixString(16).padLeft(8, '0')}"
+          : null,
       'data': data,
     };
   }
@@ -183,8 +185,8 @@ class EventsTimelineState extends State<EventsTimeline> {
     super.initState();
     pixelsPerMinute = widget.pixelsPerMinute;
     final initial = (widget.initialDate ?? widget.controller.focusedDay);
-    final initialDay = DateTime(initial.year, initial.month, initial.day);
-    origin = initialDay.subtract(Duration(days: widget.maxPreviousDays));
+    // final initialDay = DateTime(initial.year, initial.month, initial.day);
+    origin = initial.subtract(Duration(days: widget.maxPreviousDays));
 
     // Start the horizontal axis pre-scrolled to the supplied offset, or
     // default to scrolling to "today".
