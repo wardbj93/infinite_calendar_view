@@ -114,4 +114,20 @@ class Event {
     }
     return null;
   }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'columnIndex': columnIndex,
+      'startTime': startTime.toIso8601String(),
+      'endTime': endTime?.toIso8601String(),
+      'isFullDay': isFullDay,
+      'title': title,
+      'description': description,
+      'color': color.value,
+      'textColor': textColor.value,
+      'data': data,
+      'eventType': eventType,
+      'daysIndex': daysIndex,
+    };
+  }
 }

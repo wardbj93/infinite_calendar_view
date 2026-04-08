@@ -28,6 +28,15 @@ class TimelineLane {
 
   /// Arbitrary user payload.
   final Object? data;
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'title': title,
+      'color': color?.value,
+      'data': data,
+    };
+  }
 }
 
 /// Pinch-to-zoom configuration for [EventsTimeline].
@@ -421,8 +430,7 @@ class EventsTimelineState extends State<EventsTimeline> {
     final dayWidth = 1440.0 * pixelsPerMinute;
     final zoom = widget.pinchToZoomParam;
     final canZoom = zoom.pinchToZoom;
-    final disableScroll =
-        pointerDownCount > 1 || isKeyboardZoomActive;
+    final disableScroll = pointerDownCount > 1 || isKeyboardZoomActive;
 
     return GestureDetector(
       onScaleStart: canZoom ? zoom.onScaleStart ?? _onScaleStart : null,
