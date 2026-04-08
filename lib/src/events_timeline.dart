@@ -164,15 +164,10 @@ class EventsTimelineState extends State<EventsTimeline> {
 
   // pinch / scale state
   double pixelsPerMinuteAtScaleStart = 1.0;
-  double focalContentX = 0;
+  double _offsetAtScaleStart = 0;
   // multi-pointer tracking (mirrors EventsPlanner._plannerPointerDownCount)
   var pointerDownCount = 0;
   var isKeyboardZoomActive = false;
-
-  // Scroll-zoom smoothing: keep a short rolling window of recent deltas
-  // and apply the average instead of each raw value.
-  static const int _scrollZoomWindowSize = 4;
-  final List<double> _scrollZoomDeltas = [];
 
   @override
   void initState() {
@@ -271,8 +266,7 @@ class EventsTimelineState extends State<EventsTimeline> {
   void _onScaleStart(ScaleStartDetails details) {
     if (details.pointerCount == 2) {
       pixelsPerMinuteAtScaleStart = pixelsPerMinute;
-      focalContentX =
-          hSync.currentOffset + details.localFocalPoint.dx;
+      _offsetAtScaleStart = hSync.currentOffset;
     }
   }
 
@@ -286,12 +280,9 @@ class EventsTimelineState extends State<EventsTimeline> {
     final maxZoom = zoom.pinchToZoomMaxPixelsPerMinute;
 
     if (minZoom <= newPpm && newPpm <= maxZoom) {
-      setState(() => pixelsPerMinute = newPpm);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        final target =
-            focalContentX * (newPpm / pixelsPerMinuteAtScaleStart) -
-            details.localFocalPoint.dx;
-        hSync.jumpTo(target);
+      setState(() {
+        pixelsPerMinute = newPpm;
+        hSync.jumpTo(_offsetAtScaleStart * scale);
       });
     }
   }
@@ -317,9 +308,9 @@ class EventsTimelineState extends State<EventsTimeline> {
     if (widget.pinchToZoomParam.pinchToZoom) {
       final isModifierPressed =
           pressed.contains(LogicalKeyboardKey.controlLeft) ||
-          pressed.contains(LogicalKeyboardKey.controlRight) ||
-          pressed.contains(LogicalKeyboardKey.metaLeft) ||
-          pressed.contains(LogicalKeyboardKey.metaRight);
+              pressed.contains(LogicalKeyboardKey.controlRight) ||
+              pressed.contains(LogicalKeyboardKey.metaLeft) ||
+              pressed.contains(LogicalKeyboardKey.metaRight);
       if (isModifierPressed != isKeyboardZoomActive) {
         setState(() => isKeyboardZoomActive = isModifierPressed);
       }
@@ -333,18 +324,8 @@ class EventsTimelineState extends State<EventsTimeline> {
       final minZoom = zoom.pinchToZoomMinPixelsPerMinute;
       final maxZoom = zoom.pinchToZoomMaxPixelsPerMinute;
       final speed = zoom.pinchToZoomSpeed;
-      final rawDelta = event.scrollDelta.dy * -0.001 * speed;
-
-      // Feed the raw delta into a rolling window and use the average
-      // so that zoom changes are gradual rather than jittery.
-      _scrollZoomDeltas.add(rawDelta);
-      if (_scrollZoomDeltas.length > _scrollZoomWindowSize) {
-        _scrollZoomDeltas.removeAt(0);
-      }
-      final smoothDelta = _scrollZoomDeltas.reduce((a, b) => a + b) /
-          _scrollZoomDeltas.length;
-
-      final newPpm = pixelsPerMinute + smoothDelta;
+      final delta = event.scrollDelta.dy * -0.001 * speed;
+      final newPpm = pixelsPerMinute + delta;
 
       if (minZoom <= newPpm && newPpm <= maxZoom) {
         final scale = newPpm / pixelsPerMinute;
@@ -482,8 +463,8 @@ class EventsTimelineState extends State<EventsTimeline> {
                         padding: EdgeInsets.zero,
                         itemExtent: dayWidth,
                         itemCount: _totalDays,
-                        itemBuilder: (context, index) => _buildHeaderItem(
-                            origin.add(Duration(days: index))),
+                        itemBuilder: (context, index) =>
+                            _buildHeaderItem(origin.add(Duration(days: index))),
                       ),
                     ),
                   ],
@@ -698,8 +679,9 @@ class EventsTimelineState extends State<EventsTimeline> {
         child: GestureDetector(
           behavior: HitTestBehavior.translucent,
           onTapDown: (details) {
-            final minutes =
-                (details.localPosition.dx / pixelsPerMinute).round().clamp(0, 1440);
+            final minutes = (details.localPosition.dx / pixelsPerMinute)
+                .round()
+                .clamp(0, 1440);
             final time = dayStart.add(Duration(minutes: minutes));
             widget.onSlotTap!(widget.lanes[laneIndex], time);
           },
@@ -727,8 +709,7 @@ class EventsTimelineState extends State<EventsTimeline> {
         height: tileHeight,
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTap:
-              widget.onEventTap == null ? null : () => widget.onEventTap!(e),
+          onTap: widget.onEventTap == null ? null : () => widget.onEventTap!(e),
           child: widget.eventBuilder?.call(e) ?? _defaultEventTile(e),
         ),
       ));
@@ -814,8 +795,7 @@ class _Layout {
 /// offset. Used so the top header and every per-lane body row scroll as one
 /// on the X axis.
 class HScrollSync {
-  HScrollSync({required double initialOffset})
-      : currentOffset = initialOffset;
+  HScrollSync({required double initialOffset}) : currentOffset = initialOffset;
 
   double currentOffset;
   final List<ScrollController> _controllers = [];
