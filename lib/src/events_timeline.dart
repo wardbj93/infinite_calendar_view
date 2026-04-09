@@ -9,34 +9,14 @@ import 'events/event.dart';
 ///
 /// Each lane corresponds to a person, room, resource, project, etc.
 /// Events are matched to a lane via [Event.eventType] == [TimelineLane.id].
+/// The lane is otherwise opaque — render it however you like via
+/// [EventsTimeline.laneLabelBuilder] using its index in the original lanes
+/// list.
 class TimelineLane {
-  const TimelineLane({
-    required this.id,
-    this.title,
-    this.color,
-    this.data,
-  });
+  const TimelineLane({required this.id});
 
   /// Unique identifier — must equal the events' `eventType` to be matched.
   final Object id;
-
-  /// Display label. Falls back to `id.toString()`.
-  final String? title;
-
-  /// Optional accent color for the lane label / row tint.
-  final Color? color;
-
-  /// Arbitrary user payload.
-  final Object? data;
-
-  Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'title': title,
-      'color': color?.value,
-      'data': data,
-    };
-  }
 }
 
 /// Pinch-to-zoom configuration for [EventsTimeline].
@@ -80,6 +60,32 @@ class TimelinePinchToZoomParameters {
   final void Function(ScaleEndDetails details)? onScaleEnd;
 }
 
+/// Current-hour vertical indicator configuration for [EventsTimeline].
+class TimelineCurrentHourIndicatorParam {
+  const TimelineCurrentHourIndicatorParam({
+    this.visible = true,
+    this.color = Colors.red,
+    this.strokeWidth = 1.0,
+    this.circleRadius = 4.0,
+    this.showCircle = true,
+  });
+
+  /// Whether the indicator line is shown.
+  final bool visible;
+
+  /// Color of the vertical line and circle.
+  final Color color;
+
+  /// Stroke width of the vertical line.
+  final double strokeWidth;
+
+  /// Radius of the circle drawn at the top of the line.
+  final double circleRadius;
+
+  /// Whether to draw a circle at the top of the line.
+  final bool showCircle;
+}
+
 /// Gantt-style timeline view: time on the X axis (infinitely scrollable),
 /// one [TimelineLane] per row on the Y axis.
 ///
@@ -108,6 +114,18 @@ class EventsTimeline extends StatefulWidget {
     this.onSlotTap,
     this.eventBuilder,
     this.laneLabelBuilder,
+    this.enableDrag = false,
+    this.enableResize = false,
+    this.scrollToZoom = false,
+    this.dragSnapMinutes = 15,
+    this.onEventDragStart,
+    this.onEventDragUpdate,
+    this.onEventDragEnd,
+    this.onEventResizeStart,
+    this.onEventResizeUpdate,
+    this.onEventResizeEnd,
+    this.willAcceptDrop,
+    this.currentHourIndicatorParam,
   });
 
   final EventsController controller;
@@ -143,10 +161,123 @@ class EventsTimeline extends StatefulWidget {
   final void Function(Event event)? onEventTap;
   final void Function(TimelineLane lane, DateTime time)? onSlotTap;
   final Widget Function(Event event)? eventBuilder;
-  final Widget Function(TimelineLane lane)? laneLabelBuilder;
+  final Widget Function(int laneIndex, TimelineLane lane)? laneLabelBuilder;
+
+  /// Whether events can be long-press-dragged to move them between lanes/times.
+  final bool enableDrag;
+
+  /// Whether events show resize handles on left/right edges.
+  final bool enableResize;
+
+  /// Whether scroll wheel zooms without needing Ctrl/Meta held.
+  final bool scrollToZoom;
+
+  /// Snap grid for drag/resize in minutes (default 15).
+  final int dragSnapMinutes;
+
+  /// Called when an event drag begins (long-press).
+  final void Function(Event event)? onEventDragStart;
+
+  /// Called every time the proposed drop cell changes during a drag.
+  final void Function(
+    Event event,
+    TimelineLane newLane,
+    DateTime newStart,
+    DateTime newEnd,
+  )? onEventDragUpdate;
+
+  /// Called when an event is dropped after dragging.
+  final Future<void> Function(
+    Event event,
+    TimelineLane newLane,
+    DateTime newStart,
+    DateTime newEnd,
+  )? onEventDragEnd;
+
+  /// Called when a resize gesture begins.
+  final void Function(Event event, bool isLeftEdge)? onEventResizeStart;
+
+  /// Called every time the proposed resize bounds change.
+  final void Function(
+    Event event,
+    DateTime newStart,
+    DateTime newEnd,
+  )? onEventResizeUpdate;
+
+  /// Called when an event edge is resized.
+  final Future<void> Function(
+    Event event,
+    DateTime newStart,
+    DateTime newEnd,
+  )? onEventResizeEnd;
+
+  /// Synchronous check whether a dragged event can be dropped on a lane.
+  /// Defaults to always-accept if null.
+  final bool Function(Event event, TimelineLane targetLane)? willAcceptDrop;
+
+  /// Optional current-hour vertical line indicator. When non-null and visible,
+  /// a vertical line is drawn at the current time on today's column.
+  final TimelineCurrentHourIndicatorParam? currentHourIndicatorParam;
 
   @override
   State<EventsTimeline> createState() => EventsTimelineState();
+}
+
+// ── Drag / Resize state holders ──────────────────────────────────────────────
+
+class _TimelineHit {
+  _TimelineHit(this.laneIndex, this.time);
+  final int laneIndex;
+  final DateTime time;
+}
+
+class _DragState {
+  _DragState({
+    required this.event,
+    required this.originalLaneIndex,
+    required this.originalStart,
+    required this.originalEnd,
+    required this.pointerOffsetFromLeft,
+    required this.eventDuration,
+    required this.tileWidth,
+    required this.tileHeight,
+  });
+
+  final Event event;
+  final int originalLaneIndex;
+  final DateTime originalStart;
+  final DateTime originalEnd;
+  final double pointerOffsetFromLeft; // px from event's left edge at grab
+  final Duration eventDuration;
+  final double tileWidth; // actual rendered width in px
+  final double tileHeight; // actual rendered height in px
+
+  // Current candidate position (updated during drag)
+  int candidateLaneIndex = -1;
+  DateTime? candidateStart;
+  DateTime? candidateEnd;
+  Offset lastGlobalPosition = Offset.zero;
+  bool accepted = true;
+}
+
+class _ResizeState {
+  _ResizeState({
+    required this.event,
+    required this.laneIndex,
+    required this.isLeftEdge,
+    required this.originalStart,
+    required this.originalEnd,
+  });
+
+  final Event event;
+  final int laneIndex;
+  final bool isLeftEdge; // true = resizing start, false = resizing end
+  final DateTime originalStart;
+  final DateTime originalEnd;
+
+  DateTime? candidateStart;
+  DateTime? candidateEnd;
+  double accumulatedDx = 0;
 }
 
 class EventsTimelineState extends State<EventsTimeline> {
@@ -177,19 +308,28 @@ class EventsTimelineState extends State<EventsTimeline> {
   // multi-pointer tracking (mirrors EventsPlanner._plannerPointerDownCount)
   var pointerDownCount = 0;
   var isKeyboardZoomActive = false;
+  bool _isZooming = false;
+
+  // ── drag / resize state ───────────────────────────────────────────────────
+  _DragState? _activeDrag;
+  _ResizeState? _activeResize;
+  OverlayEntry? _dragOverlay;
+  _Layout? _currentLayout; // cached for coordinate math during drag
 
   @override
   void initState() {
     super.initState();
     pixelsPerMinute = widget.pixelsPerMinute;
     final initial = (widget.initialDate ?? widget.controller.focusedDay);
-    final initialDay = DateTime(initial.year, initial.month, initial.day);
-    origin = initialDay.subtract(Duration(days: widget.maxPreviousDays));
+    final initialMidnight =
+        DateTime(initial.year, initial.month, initial.day);
+    origin = initialMidnight.subtract(Duration(days: widget.maxPreviousDays));
 
-    // Start the horizontal axis pre-scrolled to the supplied offset, or
-    // default to scrolling to "today".
+    final minutesSinceMidnight =
+        initial.hour * 60 + initial.minute + initial.second / 60.0;
     final initialHOffset = widget.initialHorizontalScrollOffset ??
-        widget.maxPreviousDays * 1440.0 * pixelsPerMinute;
+        (widget.maxPreviousDays * 1440.0 + minutesSinceMidnight) *
+            pixelsPerMinute;
     hSync = HScrollSync(
       initialOffset: initialHOffset,
     );
@@ -233,6 +373,7 @@ class EventsTimelineState extends State<EventsTimeline> {
 
   @override
   void dispose() {
+    _removeDragOverlay();
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
     widget.controller.removeListener(_onData);
     hHeader.dispose();
@@ -272,31 +413,71 @@ class EventsTimelineState extends State<EventsTimeline> {
 
   // ── scale / zoom (mirrors EventsPlanner pattern) ─────────────────────────
 
+  double _focalLocalX = 0;
+  double _minuteAtFocal = 0;
+
   void _onScaleStart(ScaleStartDetails details) {
-    if (details.pointerCount == 2) {
-      pixelsPerMinuteAtScaleStart = pixelsPerMinute;
-      _offsetAtScaleStart = hSync.currentOffset;
-    }
+    _isZooming = true;
+    pixelsPerMinuteAtScaleStart = pixelsPerMinute;
+    _offsetAtScaleStart = hSync.currentOffset;
+    // Capture the focal point relative to the timeline body.
+    final rb = context.findRenderObject() as RenderBox?;
+    _focalLocalX = rb != null
+        ? rb.globalToLocal(details.focalPoint).dx - widget.laneLabelWidth
+        : 0.0;
+    _minuteAtFocal =
+        (_offsetAtScaleStart + _focalLocalX) / pixelsPerMinute;
   }
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
-    if (details.pointerCount != 2) return;
     final zoom = widget.pinchToZoomParam;
     final speed = zoom.pinchToZoomSpeed;
-    final scale = (((details.horizontalScale - 1) * speed) + 1);
-    final newPpm = pixelsPerMinuteAtScaleStart * scale;
     final minZoom = zoom.pinchToZoomMinPixelsPerMinute;
     final maxZoom = zoom.pinchToZoomMaxPixelsPerMinute;
 
-    if (minZoom <= newPpm && newPpm <= maxZoom) {
+    // Pinch-to-zoom (two pointers or trackpad pinch with scale != 1.0)
+    if (details.pointerCount >= 2 ||
+        (details.scale - 1.0).abs() > 0.01) {
+      final scale = (((details.horizontalScale - 1) * speed) + 1);
+      final newPpm =
+          (pixelsPerMinuteAtScaleStart * scale).clamp(minZoom, maxZoom);
+      if (newPpm == pixelsPerMinute) return;
+
+      final newOffset = _minuteAtFocal * newPpm - _focalLocalX;
       setState(() {
         pixelsPerMinute = newPpm;
-        hSync.jumpTo(_offsetAtScaleStart * scale);
+        hSync.jumpTo(newOffset.clamp(0, double.infinity));
+      });
+      return;
+    }
+
+    // Scroll-to-zoom: trackpad two-finger vertical scroll (scale ≈ 1.0)
+    if (widget.scrollToZoom) {
+      final dy = details.focalPointDelta.dy;
+      if (dy.abs() < 0.5) return;
+      final delta = dy * -0.005 * speed;
+      final newPpm = (pixelsPerMinute + delta).clamp(minZoom, maxZoom);
+      if (newPpm == pixelsPerMinute) return;
+
+      // Zoom relative to the focal point.
+      final rb = context.findRenderObject() as RenderBox?;
+      final localX = rb != null
+          ? rb.globalToLocal(details.focalPoint).dx - widget.laneLabelWidth
+          : 0.0;
+      final minuteUnderFocal =
+          (hSync.currentOffset + localX) / pixelsPerMinute;
+      final newOffset = minuteUnderFocal * newPpm - localX;
+
+      setState(() {
+        pixelsPerMinute = newPpm;
+        zoom.onZoomChange?.call(pixelsPerMinute);
+        hSync.jumpTo(newOffset.clamp(0, double.infinity));
       });
     }
   }
 
   void _onScaleEnd(ScaleEndDetails details) {
+    setState(() => _isZooming = false);
     widget.controller.notifyListeners();
     widget.pinchToZoomParam.onZoomChange?.call(pixelsPerMinute);
   }
@@ -334,17 +515,433 @@ class EventsTimelineState extends State<EventsTimeline> {
       final maxZoom = zoom.pinchToZoomMaxPixelsPerMinute;
       final speed = zoom.pinchToZoomSpeed;
       final delta = event.scrollDelta.dy * -0.001 * speed;
-      final newPpm = pixelsPerMinute + delta;
+      final newPpm = (pixelsPerMinute + delta).clamp(minZoom, maxZoom);
+      if (newPpm == pixelsPerMinute) return;
 
-      if (minZoom <= newPpm && newPpm <= maxZoom) {
-        final scale = newPpm / pixelsPerMinute;
-        setState(() {
-          pixelsPerMinute = newPpm;
-          zoom.onZoomChange?.call(pixelsPerMinute);
-          hSync.jumpTo(hSync.currentOffset * scale);
-        });
+      // Zoom relative to cursor: the minute under the cursor stays fixed.
+      final rb = context.findRenderObject() as RenderBox?;
+      final localX = rb != null
+          ? rb.globalToLocal(event.position).dx - widget.laneLabelWidth
+          : 0.0;
+      final minuteUnderCursor =
+          (hSync.currentOffset + localX) / pixelsPerMinute;
+      final newOffset = minuteUnderCursor * newPpm - localX;
+
+      setState(() {
+        _isZooming = true;
+        pixelsPerMinute = newPpm;
+        zoom.onZoomChange?.call(pixelsPerMinute);
+        hSync.jumpTo(newOffset.clamp(0, double.infinity));
+      });
+      // Reset after this frame so the next non-zoom rebuild animates normally.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _isZooming) setState(() => _isZooming = false);
+      });
+    }
+  }
+
+  // ── drag / resize helpers ────────────────────────────────────────────────
+
+  /// Convert a global pointer position to (laneIndex, snapped DateTime).
+  /// Returns null if the pointer is outside the body area.
+  _TimelineHit? _globalToTimeline(Offset globalPosition) {
+    final rb = context.findRenderObject() as RenderBox?;
+    if (rb == null) return null;
+    final local = rb.globalToLocal(globalPosition);
+
+    // X: subtract lane label width to get into body area
+    final bodyX = local.dx - widget.laneLabelWidth;
+    if (bodyX < 0) return null;
+
+    // Add horizontal scroll offset to get absolute position in content
+    final absX = bodyX + hSync.currentOffset;
+    final dayWidth = 1440.0 * pixelsPerMinute;
+    final dayIndex = (absX / dayWidth).floor();
+    final minuteInDay =
+        ((absX % dayWidth) / pixelsPerMinute).round().clamp(0, 1440);
+
+    // Snap to grid
+    final snap = widget.dragSnapMinutes;
+    final snappedMinute =
+        snap > 0 ? (minuteInDay / snap).round() * snap : minuteInDay;
+
+    final day = origin.add(Duration(days: dayIndex));
+    final time = DateTime(day.year, day.month, day.day)
+        .add(Duration(minutes: snappedMinute));
+
+    // Y: subtract header height, add vertical scroll offset
+    final bodyY = local.dy - widget.headerHeight;
+    if (bodyY < 0) return null;
+    final absY = bodyY + (vBody.hasClients ? vBody.offset : 0);
+
+    // Walk cumulative lane heights to find lane index
+    final layout = _currentLayout;
+    if (layout == null) return null;
+    double cumH = 0;
+    for (var i = 0; i < layout.lanes.length; i++) {
+      cumH += layout.lanes[i].height;
+      if (absY < cumH) return _TimelineHit(i, time);
+    }
+    // Below all lanes → clamp to last lane
+    return _TimelineHit(layout.lanes.length - 1, time);
+  }
+
+  /// Compute the local position (relative to the timeline widget) for a given
+  /// lane index and time. Used for positioning the ghost overlay.
+  Offset? _timelineToLocal(int laneIndex, DateTime time) {
+    final layout = _currentLayout;
+    if (layout == null || laneIndex < 0 || laneIndex >= layout.lanes.length) {
+      return null;
+    }
+
+    // X position
+    final dayStart = DateTime(time.year, time.month, time.day);
+    final dayDiff = dayStart.difference(origin).inDays;
+    final minuteInDay = time.difference(dayStart).inMinutes;
+    final absX = (dayDiff * 1440.0 + minuteInDay) * pixelsPerMinute;
+    final localX = widget.laneLabelWidth + absX - hSync.currentOffset;
+
+    // Y position
+    double cumH = 0;
+    for (var i = 0; i < laneIndex; i++) {
+      cumH += layout.lanes[i].height;
+    }
+    final localY =
+        widget.headerHeight + cumH - (vBody.hasClients ? vBody.offset : 0);
+
+    return Offset(localX, localY);
+  }
+
+  void _removeDragOverlay() {
+    _dragOverlay?.remove();
+    _dragOverlay = null;
+  }
+
+  void _updateDragOverlay() {
+    _dragOverlay?.markNeedsBuild();
+  }
+
+  // ── event drag (long-press) ─────────────────────────────────────────────
+
+  void _onEventLongPressStart(LongPressStartDetails details, Event event,
+      int laneIndex, double tileWidth, double tileHeight) {
+    if (event.isMultiDay || event.isFullDay) return;
+
+    final end = event.endTime ?? event.startTime.add(const Duration(hours: 1));
+    final pointerOffsetFromLeft =
+        details.globalPosition.dx - _eventGlobalLeft(event, laneIndex);
+
+    _activeDrag = _DragState(
+      event: event,
+      originalLaneIndex: laneIndex,
+      originalStart: event.startTime,
+      originalEnd: end,
+      pointerOffsetFromLeft: pointerOffsetFromLeft.clamp(0, double.infinity),
+      eventDuration: end.difference(event.startTime),
+      tileWidth: tileWidth,
+      tileHeight: tileHeight,
+    );
+    _activeDrag!.candidateLaneIndex = laneIndex;
+    _activeDrag!.candidateStart = event.startTime;
+    _activeDrag!.candidateEnd = end;
+    _activeDrag!.lastGlobalPosition = details.globalPosition;
+
+    widget.onEventDragStart?.call(event);
+    _insertDragOverlay();
+    setState(() {});
+  }
+
+  /// Approximate global left edge of an event tile (for offset calculation).
+  double _eventGlobalLeft(Event event, int laneIndex) {
+    final rb = context.findRenderObject() as RenderBox?;
+    if (rb == null) return 0;
+    final tlOrigin = rb.localToGlobal(Offset.zero);
+    final dayStart = DateTime(
+        event.startTime.year, event.startTime.month, event.startTime.day);
+    final dayDiff = dayStart.difference(origin).inDays;
+    final minuteInDay = event.startTime.difference(dayStart).inMinutes;
+    final absX = (dayDiff * 1440.0 + minuteInDay) * pixelsPerMinute;
+    return tlOrigin.dx + widget.laneLabelWidth + absX - hSync.currentOffset;
+  }
+
+  void _onEventLongPressMoveUpdate(LongPressMoveUpdateDetails details) {
+    final drag = _activeDrag;
+    if (drag == null) return;
+
+    drag.lastGlobalPosition = details.globalPosition;
+
+    // Compute candidate lane+time, accounting for where the user grabbed
+    final adjustedGlobal = Offset(
+      details.globalPosition.dx - drag.pointerOffsetFromLeft,
+      details.globalPosition.dy,
+    );
+
+    final hit = _globalToTimeline(adjustedGlobal);
+    if (hit != null) {
+      final changed = drag.candidateLaneIndex != hit.laneIndex ||
+          drag.candidateStart != hit.time;
+      drag.candidateLaneIndex = hit.laneIndex;
+      drag.candidateStart = hit.time;
+      drag.candidateEnd = hit.time.add(drag.eventDuration);
+
+      // Check willAcceptDrop
+      if (widget.willAcceptDrop != null &&
+          hit.laneIndex < widget.lanes.length) {
+        drag.accepted =
+            widget.willAcceptDrop!(drag.event, widget.lanes[hit.laneIndex]);
+      } else {
+        drag.accepted = true;
+      }
+
+      if (changed && hit.laneIndex < widget.lanes.length) {
+        widget.onEventDragUpdate?.call(
+          drag.event,
+          widget.lanes[hit.laneIndex],
+          drag.candidateStart!,
+          drag.candidateEnd!,
+        );
       }
     }
+
+    // Auto-scroll near edges
+    _autoScrollDuringDrag(details.globalPosition);
+
+    _updateDragOverlay();
+  }
+
+  void _onEventLongPressEnd(LongPressEndDetails details) async {
+    final drag = _activeDrag;
+    if (drag == null) return;
+
+    if (drag.accepted &&
+        drag.candidateStart != null &&
+        drag.candidateEnd != null &&
+        drag.candidateLaneIndex >= 0 &&
+        drag.candidateLaneIndex < widget.lanes.length) {
+      await widget.onEventDragEnd?.call(
+        drag.event,
+        widget.lanes[drag.candidateLaneIndex],
+        drag.candidateStart!,
+        drag.candidateEnd!,
+      );
+    }
+
+    _removeDragOverlay();
+    _activeDrag = null;
+    if (mounted) setState(() {});
+  }
+
+  void _autoScrollDuringDrag(Offset globalPosition) {
+    final rb = context.findRenderObject() as RenderBox?;
+    if (rb == null) return;
+    final local = rb.globalToLocal(globalPosition);
+    final size = rb.size;
+
+    // Horizontal auto-scroll only — within 40px of left/right edge
+    const edgeZone = 40.0;
+    const scrollSpeed = 8.0;
+    if (local.dx > size.width - edgeZone) {
+      hSync.jumpTo(hSync.currentOffset + scrollSpeed);
+    } else if (local.dx < widget.laneLabelWidth + edgeZone) {
+      hSync.jumpTo(hSync.currentOffset - scrollSpeed);
+    }
+    // No vertical auto-scroll — dragging between lanes causes the pointer
+    // to move vertically which would trigger scroll and make it unusable.
+  }
+
+  void _insertDragOverlay() {
+    _removeDragOverlay();
+    _dragOverlay = OverlayEntry(builder: (_) => _buildDragOverlay());
+    Overlay.of(context).insert(_dragOverlay!);
+  }
+
+  Widget _buildDragOverlay() {
+    final drag = _activeDrag;
+    final resize = _activeResize;
+
+    if (drag != null) return _buildDragFeedback(drag);
+    if (resize != null) return _buildResizeFeedback(resize);
+    return const SizedBox.shrink();
+  }
+
+  Widget _buildDragFeedback(_DragState drag) {
+    final candidateStart = drag.candidateStart;
+    final candidateEnd = drag.candidateEnd;
+    if (candidateStart == null || candidateEnd == null) {
+      return const SizedBox.shrink();
+    }
+
+    // Use the actual captured tile dimensions from the rendered event
+    final widthPx = drag.tileWidth;
+    final heightPx = drag.tileHeight;
+
+    // Ghost at snapped position
+    final ghostPos = _timelineToLocal(drag.candidateLaneIndex, candidateStart);
+
+    final rb = context.findRenderObject() as RenderBox?;
+    final timelineOrigin = rb?.localToGlobal(Offset.zero) ?? Offset.zero;
+
+    return Stack(
+      children: [
+        // Ghost preview at snap position
+        if (ghostPos != null)
+          Positioned(
+            left: timelineOrigin.dx + ghostPos.dx,
+            top: timelineOrigin.dy + ghostPos.dy + widget.eventSpacing,
+            child: IgnorePointer(
+              child: Container(
+                width: widthPx < 2 ? 2 : widthPx,
+                height: heightPx,
+                decoration: BoxDecoration(
+                  color: (drag.accepted ? drag.event.color : Colors.red)
+                      .withValues(alpha: 0.3),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(
+                    color: drag.accepted ? drag.event.color : Colors.red,
+                    width: 1.5,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        // Dragged tile following pointer — same size and content as the original
+        Positioned(
+          left: drag.lastGlobalPosition.dx - drag.pointerOffsetFromLeft,
+          top: drag.lastGlobalPosition.dy - heightPx / 2,
+          child: IgnorePointer(
+            child: Opacity(
+              opacity: 0.7,
+              child: SizedBox(
+                width: widthPx < 2 ? 2 : widthPx,
+                height: heightPx,
+                child: widget.eventBuilder?.call(drag.event) ??
+                    _defaultEventTile(drag.event),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildResizeFeedback(_ResizeState resize) {
+    final start = resize.candidateStart ?? resize.originalStart;
+    final end = resize.candidateEnd ?? resize.originalEnd;
+    final durationMinutes = end.difference(start).inMinutes;
+    if (durationMinutes <= 0) return const SizedBox.shrink();
+
+    final widthPx = durationMinutes * pixelsPerMinute;
+    // Use actual tile height from lane layout
+    final layout = _currentLayout;
+    final laneLayout =
+        (layout != null && resize.laneIndex < layout.lanes.length)
+            ? layout.lanes[resize.laneIndex]
+            : null;
+    final heightPx = laneLayout?.eventTileHeight(widget.eventSpacing) ??
+        widget.eventHeight.toDouble();
+    final ghostPos = _timelineToLocal(resize.laneIndex, start);
+
+    final rb = context.findRenderObject() as RenderBox?;
+    final timelineOrigin = rb?.localToGlobal(Offset.zero) ?? Offset.zero;
+
+    if (ghostPos == null) return const SizedBox.shrink();
+
+    return Stack(
+      children: [
+        Positioned(
+          left: timelineOrigin.dx + ghostPos.dx,
+          top: timelineOrigin.dy + ghostPos.dy + widget.eventSpacing,
+          child: IgnorePointer(
+            child: SizedBox(
+              width: widthPx < 2 ? 2 : widthPx,
+              height: heightPx,
+              child: widget.eventBuilder?.call(resize.event) ??
+                  _defaultEventTile(resize.event),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ── event resize ────────────────────────────────────────────────────────
+
+  GestureRecognizerFactoryWithHandlers<HorizontalDragGestureRecognizer>
+      _resizeHandleGesture(Event event, int laneIndex, bool isLeftEdge) {
+    return GestureRecognizerFactoryWithHandlers<
+        HorizontalDragGestureRecognizer>(
+      () => HorizontalDragGestureRecognizer(),
+      (instance) {
+        instance.onStart = (details) {
+          if (event.isMultiDay || event.isFullDay) return;
+          final end =
+              event.endTime ?? event.startTime.add(const Duration(hours: 1));
+          _activeResize = _ResizeState(
+            event: event,
+            laneIndex: laneIndex,
+            isLeftEdge: isLeftEdge,
+            originalStart: event.startTime,
+            originalEnd: end,
+          );
+          _activeResize!.candidateStart = event.startTime;
+          _activeResize!.candidateEnd = end;
+          widget.onEventResizeStart?.call(event, isLeftEdge);
+          _insertDragOverlay();
+          setState(() {});
+        };
+        instance.onUpdate = (details) {
+          final resize = _activeResize;
+          if (resize == null) return;
+          final snap = widget.dragSnapMinutes;
+          resize.accumulatedDx += details.delta.dx;
+          final deltaMinutes = (resize.accumulatedDx / pixelsPerMinute).round();
+          final snappedDelta =
+              snap > 0 ? (deltaMinutes / snap).round() * snap : deltaMinutes;
+
+          final prevStart = resize.candidateStart;
+          final prevEnd = resize.candidateEnd;
+          if (resize.isLeftEdge) {
+            final newStart =
+                resize.originalStart.add(Duration(minutes: snappedDelta));
+            final endBound = resize.candidateEnd ?? resize.originalEnd;
+            if (newStart.isBefore(endBound) &&
+                endBound.difference(newStart).inMinutes >= snap) {
+              resize.candidateStart = newStart;
+            }
+          } else {
+            final newEnd =
+                resize.originalEnd.add(Duration(minutes: snappedDelta));
+            final startBound = resize.candidateStart ?? resize.originalStart;
+            if (newEnd.isAfter(startBound) &&
+                newEnd.difference(startBound).inMinutes >= snap) {
+              resize.candidateEnd = newEnd;
+            }
+          }
+          if (prevStart != resize.candidateStart ||
+              prevEnd != resize.candidateEnd) {
+            widget.onEventResizeUpdate?.call(
+              resize.event,
+              resize.candidateStart ?? resize.originalStart,
+              resize.candidateEnd ?? resize.originalEnd,
+            );
+          }
+          _updateDragOverlay();
+          setState(() {});
+        };
+        instance.onEnd = (details) async {
+          final resize = _activeResize;
+          if (resize == null) return;
+          await widget.onEventResizeEnd?.call(
+            resize.event,
+            resize.candidateStart ?? resize.originalStart,
+            resize.candidateEnd ?? resize.originalEnd,
+          );
+          _removeDragOverlay();
+          _activeResize = null;
+          if (mounted) setState(() {});
+        };
+      },
+    );
   }
 
   // ── layout ───────────────────────────────────────────────────────────────
@@ -426,23 +1023,32 @@ class EventsTimelineState extends State<EventsTimeline> {
   @override
   Widget build(BuildContext context) {
     final layout = _computeLayout();
+    _currentLayout = layout; // cache for drag coordinate math
     final lanes = layout.lanes;
     final dayWidth = 1440.0 * pixelsPerMinute;
     final zoom = widget.pinchToZoomParam;
-    final canZoom = zoom.pinchToZoom;
-    final disableScroll = pointerDownCount > 1 || isKeyboardZoomActive;
+    final isDraggingOrResizing = _activeDrag != null || _activeResize != null;
+    final canZoom = zoom.pinchToZoom && !isDraggingOrResizing;
+    final scrollZoomActive =
+        (widget.scrollToZoom || isKeyboardZoomActive) && !isDraggingOrResizing;
+    final disableScroll =
+        pointerDownCount > 1 || isKeyboardZoomActive || isDraggingOrResizing;
 
     return GestureDetector(
       onScaleStart: canZoom ? zoom.onScaleStart ?? _onScaleStart : null,
       onScaleUpdate: canZoom ? zoom.onScaleUpdate ?? _onScaleUpdate : null,
       onScaleEnd: canZoom ? zoom.onScaleEnd ?? _onScaleEnd : null,
       child: Listener(
-        onPointerSignal: isKeyboardZoomActive ? _onPointerSignal : null,
-        onPointerDown: canZoom ? (_) => _onPointerDown() : null,
-        onPointerCancel: canZoom ? (_) => _onPointerUp() : null,
-        onPointerUp: canZoom ? (_) => _onPointerUp() : null,
+        onPointerSignal: scrollZoomActive ? _onPointerSignal : null,
+        // Always track pointer up/down so the count can't get stuck when
+        // drag/resize toggles `canZoom` mid-gesture.
+        onPointerDown: zoom.pinchToZoom ? (_) => _onPointerDown() : null,
+        onPointerCancel: zoom.pinchToZoom ? (_) => _onPointerUp() : null,
+        onPointerUp: zoom.pinchToZoom ? (_) => _onPointerUp() : null,
         child: IgnorePointer(
-          ignoring: canZoom ? pointerDownCount > 1 : false,
+          ignoring: zoom.pinchToZoom && !isDraggingOrResizing
+              ? pointerDownCount > 1
+              : false,
           child: Column(
             children: [
               // Top header row (corner + lazy scrolling time header)
@@ -490,21 +1096,25 @@ class EventsTimelineState extends State<EventsTimeline> {
                       width: widget.laneLabelWidth,
                       child: ListView.builder(
                         controller: vLabels,
-                        physics: const ClampingScrollPhysics(),
+                        physics: widget.scrollToZoom
+                            ? const NeverScrollableScrollPhysics()
+                            : const ClampingScrollPhysics(),
                         padding: EdgeInsets.zero,
                         itemCount: widget.lanes.length,
                         itemBuilder: (context, i) => SizedBox(
                           height: lanes[i].height,
-                          child:
-                              widget.laneLabelBuilder?.call(widget.lanes[i]) ??
-                                  _defaultLaneLabel(widget.lanes[i]),
+                          child: widget.laneLabelBuilder
+                                  ?.call(i, widget.lanes[i]) ??
+                              _defaultLaneLabel(widget.lanes[i]),
                         ),
                       ),
                     ),
                     Expanded(
                       child: ListView.builder(
                         controller: vBody,
-                        physics: const ClampingScrollPhysics(),
+                        physics: widget.scrollToZoom
+                            ? const NeverScrollableScrollPhysics()
+                            : const ClampingScrollPhysics(),
                         padding: EdgeInsets.zero,
                         itemCount: widget.lanes.length,
                         itemBuilder: (context, i) {
@@ -710,15 +1320,121 @@ class EventsTimelineState extends State<EventsTimeline> {
       final width = widthMin * pixelsPerMinute;
       final top =
           widget.eventSpacing + subRow * (tileHeight + widget.eventSpacing);
-      children.add(Positioned(
+
+      final isDragging = _activeDrag?.event.uniqueId == e.uniqueId;
+      final isResizing = _activeResize?.event.uniqueId == e.uniqueId;
+      final canInteract = !e.isMultiDay && !e.isFullDay;
+      final eventContent = widget.eventBuilder?.call(e) ?? _defaultEventTile(e);
+
+      Widget tile;
+      if (canInteract && (widget.enableDrag || widget.enableResize)) {
+        tile = Stack(
+          children: [
+            // Main body — handles tap + long-press drag
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: widget.onEventTap == null
+                    ? null
+                    : () => widget.onEventTap!(e),
+                onLongPressStart: widget.enableDrag
+                    ? (details) => _onEventLongPressStart(details, e, laneIndex,
+                        width < 2 ? 2 : width, tileHeight)
+                    : null,
+                onLongPressMoveUpdate:
+                    widget.enableDrag ? _onEventLongPressMoveUpdate : null,
+                onLongPressEnd: widget.enableDrag ? _onEventLongPressEnd : null,
+                child: eventContent,
+              ),
+            ),
+            // Left resize handle
+            if (widget.enableResize)
+              Positioned(
+                left: 0,
+                top: 0,
+                bottom: 0,
+                width: 8,
+                child: RawGestureDetector(
+                  gestures: {
+                    HorizontalDragGestureRecognizer:
+                        _resizeHandleGesture(e, laneIndex, true),
+                  },
+                  child: MouseRegion(
+                    cursor: SystemMouseCursors.resizeLeft,
+                    child: Container(color: Colors.transparent),
+                  ),
+                ),
+              ),
+            // Right resize handle
+            if (widget.enableResize)
+              Positioned(
+                right: 0,
+                top: 0,
+                bottom: 0,
+                width: 8,
+                child: RawGestureDetector(
+                  gestures: {
+                    HorizontalDragGestureRecognizer:
+                        _resizeHandleGesture(e, laneIndex, false),
+                  },
+                  child: MouseRegion(
+                    cursor: SystemMouseCursors.resizeRight,
+                    child: Container(color: Colors.transparent),
+                  ),
+                ),
+              ),
+          ],
+        );
+      } else {
+        tile = GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: widget.onEventTap == null ? null : () => widget.onEventTap!(e),
+          child: eventContent,
+        );
+      }
+
+      children.add(AnimatedPositioned(
+        key: e.isMultiDay
+            ? ValueKey(e.uniqueId)
+            : GlobalObjectKey(e.uniqueId),
+        duration: (isDragging || isResizing || _isZooming)
+            ? Duration.zero
+            : const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
         left: leftMin * pixelsPerMinute,
         top: top,
         width: width < 2 ? 2 : width,
         height: tileHeight,
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: widget.onEventTap == null ? null : () => widget.onEventTap!(e),
-          child: widget.eventBuilder?.call(e) ?? _defaultEventTile(e),
+        child: Opacity(
+          opacity: (isDragging || isResizing) ? 0.3 : 1.0,
+          child: tile,
+        ),
+      ));
+    }
+
+    // Current hour indicator (vertical line at "now" on today's cell)
+    final indicator = widget.currentHourIndicatorParam;
+    if (indicator != null &&
+        indicator.visible &&
+        DateUtils.isSameDay(day, DateTime.now())) {
+      final now = DateTime.now();
+      final minutesSinceMidnight =
+          now.hour * 60 + now.minute + now.second / 60.0;
+      final xPos = minutesSinceMidnight * pixelsPerMinute;
+      children.add(Positioned(
+        left: xPos - indicator.strokeWidth / 2,
+        top: 0,
+        bottom: 0,
+        width: indicator.strokeWidth,
+        child: IgnorePointer(
+          child: CustomPaint(
+            painter: _TimelineCurrentHourPainter(
+              color: indicator.color,
+              strokeWidth: indicator.strokeWidth,
+              circleRadius: indicator.circleRadius,
+              showCircle: indicator.showCircle,
+            ),
+          ),
         ),
       ));
     }
@@ -735,14 +1451,13 @@ class EventsTimelineState extends State<EventsTimeline> {
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
       alignment: Alignment.topLeft,
       decoration: BoxDecoration(
-        color: lane.color?.withValues(alpha: 0.12),
         border: Border(
           right: BorderSide(color: Colors.grey.shade400, width: 0.5),
           bottom: BorderSide(color: Colors.grey.shade300, width: 0.5),
         ),
       ),
       child: Text(
-        lane.title ?? lane.id.toString(),
+        lane.id.toString(),
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12),
@@ -790,6 +1505,40 @@ class _LaneLayout {
     final h = (height - spacing * (subRows + 1)) / subRows;
     return h < 1 ? 1 : h;
   }
+}
+
+class _TimelineCurrentHourPainter extends CustomPainter {
+  const _TimelineCurrentHourPainter({
+    required this.color,
+    required this.strokeWidth,
+    required this.circleRadius,
+    required this.showCircle,
+  });
+
+  final Color color;
+  final double strokeWidth;
+  final double circleRadius;
+  final bool showCircle;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = strokeWidth;
+    // Vertical line spanning the full height of the cell.
+    final x = size.width / 2;
+    canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+    if (showCircle) {
+      canvas.drawCircle(Offset(x, circleRadius), circleRadius, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_TimelineCurrentHourPainter oldDelegate) =>
+      color != oldDelegate.color ||
+      strokeWidth != oldDelegate.strokeWidth ||
+      circleRadius != oldDelegate.circleRadius ||
+      showCircle != oldDelegate.showCircle;
 }
 
 class _Layout {
