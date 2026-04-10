@@ -110,6 +110,7 @@ class EventsTimeline extends StatefulWidget {
     this.onSlotTap,
     this.eventBuilder,
     this.laneLabelBuilder,
+    this.dateHeaderBuilder,
   });
 
   final EventsController controller;
@@ -146,6 +147,7 @@ class EventsTimeline extends StatefulWidget {
   final void Function(TimelineLane lane, DateTime time)? onSlotTap;
   final Widget Function(Event event)? eventBuilder;
   final Widget Function(TimelineLane lane)? laneLabelBuilder;
+  final Widget Function(DateTime day)? dateHeaderBuilder;
 
   @override
   State<EventsTimeline> createState() => EventsTimelineState();
@@ -598,11 +600,13 @@ class EventsTimelineState extends State<EventsTimeline> {
                 bottom: BorderSide(color: Colors.grey.shade300, width: 0.5),
               ),
             ),
-            child: Text(
-              _formatDate(day, dayWidth),
-              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
-              overflow: TextOverflow.ellipsis,
-            ),
+            child: widget.dateHeaderBuilder?.call(day) ??
+                Text(
+                  _formatDate(day, dayWidth),
+                  style: const TextStyle(
+                      fontSize: 11, fontWeight: FontWeight.w600),
+                  overflow: TextOverflow.ellipsis,
+                ),
           ),
           if (hourStep < 24)
             SizedBox(
