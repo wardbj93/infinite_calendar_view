@@ -13,7 +13,12 @@ import 'events/event.dart';
 /// [EventsTimeline.laneLabelBuilder] using its index in the original lanes
 /// list.
 class TimelineLane {
-  const TimelineLane({required this.id});
+  const TimelineLane({
+    required this.id,
+    this.title,
+    this.color,
+    this.data,
+  });
 
   /// Unique identifier — must equal the events' `eventType` to be matched.
   final Object id;
