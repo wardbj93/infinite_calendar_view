@@ -18,9 +18,9 @@ class Event {
   }) {
     if (!isFullDay) {
       assert(endTime != null);
-      assert(endTime!.isAfter(startTime));
+      assert(!endTime!.isBefore(startTime));
     } else if (endTime != null) {
-      assert(endTime!.isAfter(startTime));
+      assert(!endTime!.isBefore(startTime));
     }
   }
 

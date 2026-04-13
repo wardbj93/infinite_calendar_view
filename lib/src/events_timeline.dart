@@ -135,11 +135,16 @@ class EventsTimeline extends StatefulWidget {
     this.eventHeight = 28,
     this.eventSpacing = 2,
     this.headerHeight = 56,
+    this.dateHeaderHeight,
     this.onEventTap,
     this.onSlotTap,
     this.eventBuilder,
     this.laneLabelBuilder,
     this.dateHeaderBuilder,
+    this.startDate,
+    this.endDate,
+    this.scrollLocked = false,
+    this.zoomLocked = false,
     this.enableDrag = false,
     this.enableResize = false,
     this.scrollToZoom = false,
@@ -151,6 +156,7 @@ class EventsTimeline extends StatefulWidget {
     this.onEventResizeUpdate,
     this.onEventResizeEnd,
     this.willAcceptDrop,
+    this.willAcceptResize,
     this.currentHourIndicatorParam,
   });
 
@@ -183,6 +189,15 @@ class EventsTimeline extends StatefulWidget {
   final double eventHeight;
   final double eventSpacing;
   final double headerHeight;
+
+  /// Optional explicit height for the top (date) row of the header.
+  ///
+  /// When null, the date row uses half of [headerHeight] (legacy 50/50 split).
+  /// When set, the date row uses this value and the total header height
+  /// becomes `dateHeaderHeight + (headerHeight * 0.5)` — i.e. the hour row
+  /// below keeps its original size while the date row grows/shrinks to fit
+  /// a custom [dateHeaderBuilder] widget.
+  final double? dateHeaderHeight;
 
   final void Function(Event event)? onEventTap;
   final void Function(TimelineLane lane, DateTime time)? onSlotTap;
@@ -237,14 +252,52 @@ class EventsTimeline extends StatefulWidget {
     DateTime newEnd,
   )? onEventResizeEnd;
 
-  /// Synchronous check whether a dragged event can be dropped on a lane.
-  /// Defaults to always-accept if null.
-  final bool Function(Event event, TimelineLane targetLane)? willAcceptDrop;
+  /// Synchronous check whether a dragged event can be dropped at a given
+  /// (lane, start, end) candidate. Defaults to always-accept if null.
+  ///
+  /// Returning `false` marks the ghost as rejected and the event snaps back
+  /// to its original position on release. Called continuously during drag
+  /// as the candidate changes.
+  final bool Function(
+    Event event,
+    TimelineLane targetLane,
+    DateTime newStart,
+    DateTime newEnd,
+  )? willAcceptDrop;
+
+  /// Synchronous check whether a resize candidate is allowed. Called
+  /// continuously during a resize gesture — if it returns `false` the new
+  /// candidate bounds are rejected and the event keeps its previous
+  /// candidate bounds. Defaults to always-accept if null.
+  final bool Function(
+    Event event,
+    DateTime newStart,
+    DateTime newEnd,
+  )? willAcceptResize;
 
   /// Optional current-hour vertical line indicator. When non-null and visible,
   /// a vertical line is drawn at the current time on today's column.
   final TimelineCurrentHourIndicatorParam? currentHourIndicatorParam;
   final Widget Function(DateTime day)? dateHeaderBuilder;
+
+  /// Hard-left boundary of the visible/scrollable range. When both [startDate]
+  /// and [endDate] are set they override [maxPreviousDays]/[maxNextDays] and
+  /// the timeline renders exactly those days.
+  final DateTime? startDate;
+
+  /// Hard-right boundary of the visible/scrollable range (inclusive).
+  final DateTime? endDate;
+
+  /// When true, disables all user scrolling (horizontal AND vertical) across
+  /// the header, lane labels column, and lane rows. Programmatic scroll via
+  /// [EventsTimelineState.jumpToDate] / [updateHorizontalScrollOffset] still
+  /// works. Typically paired with [startDate]/[endDate] to lock the view to a
+  /// specific window.
+  final bool scrollLocked;
+
+  /// When true, disables all zoom interactions (pinch, wheel+modifier,
+  /// scroll-to-zoom). The timeline stays at the supplied [pixelsPerMinute].
+  final bool zoomLocked;
 
   @override
   State<EventsTimeline> createState() => EventsTimelineState();
@@ -343,19 +396,33 @@ class EventsTimelineState extends State<EventsTimeline> {
   OverlayEntry? _dragOverlay;
   _Layout? _currentLayout; // cached for coordinate math during drag
 
+  // Per-resize-session cache so `willAcceptResize` is only evaluated when the
+  // proposed bounds actually change, not on every pointer tick.
+  DateTime? _lastResizeAskStart;
+  DateTime? _lastResizeAskEnd;
+  bool _lastResizeAskResult = true;
+
   @override
   void initState() {
     super.initState();
     pixelsPerMinute = widget.pixelsPerMinute;
     final initial = (widget.initialDate ?? widget.controller.focusedDay);
     final initialMidnight = DateTime(initial.year, initial.month, initial.day);
-    origin = initialMidnight.subtract(Duration(days: widget.maxPreviousDays));
+
+    // If an explicit start/end range is supplied, use it as the hard origin
+    // instead of measuring maxPreviousDays back from `initial`.
+    final lockedStart = widget.startDate;
+    if (lockedStart != null) {
+      origin = DateTime(lockedStart.year, lockedStart.month, lockedStart.day);
+    } else {
+      origin = initialMidnight.subtract(Duration(days: widget.maxPreviousDays));
+    }
 
     final minutesSinceMidnight =
         initial.hour * 60 + initial.minute + initial.second / 60.0;
+    final daysFromOrigin = initialMidnight.difference(origin).inDays;
     final initialHOffset = widget.initialHorizontalScrollOffset ??
-        (widget.maxPreviousDays * 1440.0 + minutesSinceMidnight) *
-            pixelsPerMinute;
+        (daysFromOrigin * 1440.0 + minutesSinceMidnight) * pixelsPerMinute;
     hSync = HScrollSync(
       initialOffset: initialHOffset,
     );
@@ -518,7 +585,7 @@ class EventsTimelineState extends State<EventsTimeline> {
   bool _handleKeyEvent(KeyEvent event) {
     final pressed = HardwareKeyboard.instance.logicalKeysPressed;
 
-    if (widget.pinchToZoomParam.pinchToZoom) {
+    if (widget.pinchToZoomParam.pinchToZoom && !widget.zoomLocked) {
       final isModifierPressed =
           pressed.contains(LogicalKeyboardKey.controlLeft) ||
               pressed.contains(LogicalKeyboardKey.controlRight) ||
@@ -593,7 +660,7 @@ class EventsTimelineState extends State<EventsTimeline> {
         .add(Duration(minutes: snappedMinute));
 
     // Y: subtract header height, add vertical scroll offset
-    final bodyY = local.dy - widget.headerHeight;
+    final bodyY = local.dy - _effectiveHeaderHeight;
     if (bodyY < 0) return null;
     final absY = bodyY + (vBody.hasClients ? vBody.offset : 0);
 
@@ -630,7 +697,7 @@ class EventsTimelineState extends State<EventsTimeline> {
       cumH += layout.lanes[i].height;
     }
     final localY =
-        widget.headerHeight + cumH - (vBody.hasClients ? vBody.offset : 0);
+        _effectiveHeaderHeight + cumH - (vBody.hasClients ? vBody.offset : 0);
 
     return Offset(localX, localY);
   }
@@ -707,16 +774,21 @@ class EventsTimelineState extends State<EventsTimeline> {
       drag.candidateStart = hit.time;
       drag.candidateEnd = hit.time.add(drag.eventDuration);
 
-      // Check willAcceptDrop
-      if (widget.willAcceptDrop != null &&
-          hit.laneIndex < widget.lanes.length) {
-        drag.accepted =
-            widget.willAcceptDrop!(drag.event, widget.lanes[hit.laneIndex]);
-      } else {
-        drag.accepted = true;
-      }
-
+      // Only re-evaluate the predicate and notify listeners when the
+      // candidate (lane or snapped start) actually changed. This keeps a
+      // 60 Hz pointer stream from pounding `willAcceptDrop` on every tick.
       if (changed && hit.laneIndex < widget.lanes.length) {
+        if (widget.willAcceptDrop != null) {
+          drag.accepted = widget.willAcceptDrop!(
+            drag.event,
+            widget.lanes[hit.laneIndex],
+            drag.candidateStart!,
+            drag.candidateEnd!,
+          );
+        } else {
+          drag.accepted = true;
+        }
+
         widget.onEventDragUpdate?.call(
           drag.event,
           widget.lanes[hit.laneIndex],
@@ -908,6 +980,10 @@ class EventsTimelineState extends State<EventsTimeline> {
           );
           _activeResize!.candidateStart = event.startTime;
           _activeResize!.candidateEnd = end;
+          // Reset per-session predicate cache.
+          _lastResizeAskStart = null;
+          _lastResizeAskEnd = null;
+          _lastResizeAskResult = true;
           widget.onEventResizeStart?.call(event, isLeftEdge);
           _insertDragOverlay();
           setState(() {});
@@ -929,7 +1005,21 @@ class EventsTimelineState extends State<EventsTimeline> {
             final endBound = resize.candidateEnd ?? resize.originalEnd;
             if (newStart.isBefore(endBound) &&
                 endBound.difference(newStart).inMinutes >= snap) {
-              resize.candidateStart = newStart;
+              // Only re-ask the predicate when the proposed bounds changed.
+              bool allowed;
+              if (widget.willAcceptResize == null) {
+                allowed = true;
+              } else if (_lastResizeAskStart == newStart &&
+                  _lastResizeAskEnd == endBound) {
+                allowed = _lastResizeAskResult;
+              } else {
+                allowed = widget.willAcceptResize!(
+                    resize.event, newStart, endBound);
+                _lastResizeAskStart = newStart;
+                _lastResizeAskEnd = endBound;
+                _lastResizeAskResult = allowed;
+              }
+              if (allowed) resize.candidateStart = newStart;
             }
           } else {
             final newEnd =
@@ -937,7 +1027,20 @@ class EventsTimelineState extends State<EventsTimeline> {
             final startBound = resize.candidateStart ?? resize.originalStart;
             if (newEnd.isAfter(startBound) &&
                 newEnd.difference(startBound).inMinutes >= snap) {
-              resize.candidateEnd = newEnd;
+              bool allowed;
+              if (widget.willAcceptResize == null) {
+                allowed = true;
+              } else if (_lastResizeAskStart == startBound &&
+                  _lastResizeAskEnd == newEnd) {
+                allowed = _lastResizeAskResult;
+              } else {
+                allowed = widget.willAcceptResize!(
+                    resize.event, startBound, newEnd);
+                _lastResizeAskStart = startBound;
+                _lastResizeAskEnd = newEnd;
+                _lastResizeAskResult = allowed;
+              }
+              if (allowed) resize.candidateEnd = newEnd;
             }
           }
           if (prevStart != resize.candidateStart ||
@@ -969,7 +1072,29 @@ class EventsTimelineState extends State<EventsTimeline> {
 
   // ── layout ───────────────────────────────────────────────────────────────
 
-  int get _totalDays => widget.maxPreviousDays + widget.maxNextDays + 1;
+  /// Height of the date row portion of the header.
+  double get _dateRowHeight =>
+      widget.dateHeaderHeight ?? (widget.headerHeight * 0.5);
+
+  /// Height of the hour row portion of the header (below the date row).
+  /// Kept at the original 50/50 default so supplying [dateHeaderHeight] only
+  /// grows/shrinks the date row.
+  double get _hourRowHeight => widget.headerHeight * 0.5;
+
+  /// Total rendered header height (date row + hour row).
+  double get _effectiveHeaderHeight => _dateRowHeight + _hourRowHeight;
+
+  int get _totalDays {
+    final s = widget.startDate;
+    final e = widget.endDate;
+    if (s != null && e != null) {
+      final sd = DateTime(s.year, s.month, s.day);
+      final ed = DateTime(e.year, e.month, e.day);
+      final diff = ed.difference(sd).inDays + 1;
+      return diff < 1 ? 1 : diff;
+    }
+    return widget.maxPreviousDays + widget.maxNextDays + 1;
+  }
 
   /// Greedy packing: assign each event to the lowest sub-row whose previous
   /// event has already ended.
@@ -1051,11 +1176,16 @@ class EventsTimelineState extends State<EventsTimeline> {
     final dayWidth = 1440.0 * pixelsPerMinute;
     final zoom = widget.pinchToZoomParam;
     final isDraggingOrResizing = _activeDrag != null || _activeResize != null;
-    final canZoom = zoom.pinchToZoom && !isDraggingOrResizing;
-    final scrollZoomActive =
-        (widget.scrollToZoom || isKeyboardZoomActive) && !isDraggingOrResizing;
-    final disableScroll =
-        pointerDownCount > 1 || isKeyboardZoomActive || isDraggingOrResizing;
+    final canZoom =
+        zoom.pinchToZoom && !isDraggingOrResizing && !widget.zoomLocked;
+    final scrollZoomActive = (widget.scrollToZoom || isKeyboardZoomActive) &&
+        !isDraggingOrResizing &&
+        !widget.zoomLocked;
+    final disableScroll = widget.scrollLocked ||
+        pointerDownCount > 1 ||
+        isKeyboardZoomActive ||
+        isDraggingOrResizing;
+    final disableVerticalScroll = widget.scrollLocked || widget.scrollToZoom;
 
     return GestureDetector(
       onScaleStart: canZoom ? zoom.onScaleStart ?? _onScaleStart : null,
@@ -1076,7 +1206,7 @@ class EventsTimelineState extends State<EventsTimeline> {
             children: [
               // Top header row (corner + lazy scrolling time header)
               SizedBox(
-                height: widget.headerHeight,
+                height: _effectiveHeaderHeight,
                 child: Row(
                   children: [
                     Container(
@@ -1119,7 +1249,7 @@ class EventsTimelineState extends State<EventsTimeline> {
                       width: widget.laneLabelWidth,
                       child: ListView.builder(
                         controller: vLabels,
-                        physics: widget.scrollToZoom
+                        physics: disableVerticalScroll
                             ? const NeverScrollableScrollPhysics()
                             : const ClampingScrollPhysics(),
                         padding: EdgeInsets.zero,
@@ -1135,7 +1265,7 @@ class EventsTimelineState extends State<EventsTimeline> {
                     Expanded(
                       child: ListView.builder(
                         controller: vBody,
-                        physics: widget.scrollToZoom
+                        physics: disableVerticalScroll
                             ? const NeverScrollableScrollPhysics()
                             : const ClampingScrollPhysics(),
                         padding: EdgeInsets.zero,
@@ -1189,8 +1319,8 @@ class EventsTimelineState extends State<EventsTimeline> {
   /// `ListView.builder`.
   Widget _buildHeaderItem(DateTime day) {
     final dayWidth = 1440.0 * pixelsPerMinute;
-    final dateRowH = widget.headerHeight * 0.5;
-    final hourRowH = widget.headerHeight - dateRowH;
+    final dateRowH = _dateRowHeight;
+    final hourRowH = _hourRowHeight;
     final hourStep = _hourStep;
 
     final hourCells = <Widget>[];
@@ -1216,7 +1346,7 @@ class EventsTimelineState extends State<EventsTimeline> {
 
     return SizedBox(
       width: dayWidth,
-      height: widget.headerHeight,
+      height: _effectiveHeaderHeight,
       child: Column(
         children: [
           Container(
